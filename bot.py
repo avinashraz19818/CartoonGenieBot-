@@ -1,70 +1,119 @@
 import os
-import replicate
-from pyrogram import Client, filters
-from pyrogram.types import Message
+import logging
 from dotenv import load_dotenv
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+import replicate
+import uuid
+import requests
+from datetime import datetime
 
-# Load environment variables from .env file
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ENV Vars
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_KEY = os.getenv("REPLICATE_API_KEY")
 OWNER_USERNAME = os.getenv("OWNER_USERNAME")
 
-# Set up Replicate
-replicate_client = replicate.Client(api_token=REPLICATE_API_KEY)
+# Init
+app = Client("cartoon_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+replicate.Client(api_token=REPLICATE_API_KEY)
+logging.basicConfig(level=logging.INFO)
 
-# Initialize the bot
-app = Client("ai_cartoon_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+# Styles
+STYLES = {
+    "Ghibli": "prompthero/openjourney",
+    "Pixar": "fofr/anything-v4.0",
+    "Sketch": "stability-ai/stable-diffusion",
+    "Realistic": "stability-ai/stable-diffusion"
+}
 
-# In-memory user limits
-user_limits = {}
+# In-memory user data (reset every run)
+user_sessions = {}
+
+# Log file
+LOG_FILE = "logs.txt"
+
+def log_action(user_id, action):
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{datetime.now()} | {user_id} | {action}\n")
+
 
 @app.on_message(filters.command("start"))
 async def start(client, message: Message):
-    await message.reply_text(
-        f"👋 **Welcome to AI Cartoon Bot!**\n\n"
-        f"🎨 Send me a photo and I will turn it into a Ghibli-style cartoon image!\n"
-        f"💡 Free users can generate 1 image per day.\n\n"
-        f"💎 Want unlimited access? Type `/vip`.\n\n"
-        f"🔧 Made by @{OWNER_USERNAME}"
+    user_sessions[message.from_user.id] = {}
+    await message.reply(
+        f"👋 Hello {message.from_user.first_name}!\nChoose your style:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(style, callback_data=f"style:{style}")] for style in STYLES
+        ])
     )
+    log_action(message.from_user.id, "Started bot")
 
-@app.on_message(filters.command("vip"))
-async def vip(client, message: Message):
-    await message.reply_text(
-        "**💎 VIP Plan**\n\n"
-        "➡ Unlimited cartoon photo generation\n"
-        "➡ Price: ₹49/month\n"
-        "➡ Pay via UPI: `yourupi@bank`\n"
-        "📩 After payment, send proof to: @" + OWNER_USERNAME
-    )
+
+@app.on_callback_query(filters.regex("^style:"))
+async def style_selected(client, callback_query):
+    style = callback_query.data.split(":")[1]
+    user_sessions[callback_query.from_user.id]["style"] = style
+    await callback_query.message.reply("📷 Send a photo to convert!")
+    await callback_query.answer(f"Style set to {style}")
+    log_action(callback_query.from_user.id, f"Selected style: {style}")
+
 
 @app.on_message(filters.photo)
 async def handle_photo(client, message: Message):
     user_id = message.from_user.id
-
-    # Limit check
-    if user_limits.get(user_id, 0) >= 1:
-        await message.reply_text("❌ Free limit reached. Type /vip to unlock unlimited use.")
+    if user_id not in user_sessions or "style" not in user_sessions[user_id]:
+        await message.reply("❗ Please /start and select a style first.")
         return
 
+    style = user_sessions[user_id]["style"]
     file_path = await message.download()
-    await message.reply_text("🎨 Converting your photo to cartoon style... Please wait...")
+    await message.reply("🧠 AI is processing your image...")
 
+    output_url = run_ai(file_path, style)
+    if output_url:
+        await message.reply_photo(photo=output_url, caption=f"✨ Style: {style}")
+        log_action(user_id, f"Converted image using {style}")
+    else:
+        await message.reply("⚠️ Failed to generate image.")
+        log_action(user_id, "Image generation failed")
+
+
+def run_ai(image_path, style):
     try:
-        output = replicate_client.run(
-            "fofr/anything-to-ghibli:15f086f3cd12e44271939f1d2b0fa8bd3019d4c016238d8e7b1efba1d1c6b75c",
-            input={"image": open(file_path, "rb")}
+        with open(image_path, "rb") as file:
+            img_upload = replicate.files.upload(file)
+        output = replicate.run(
+            STYLES[style] + ":latest",
+            input={"image": img_upload}
         )
-        cartoon_url = output["output"]
-        await message.reply_photo(cartoon_url, caption="Here is your cartoon image! 😊")
-        user_limits[user_id] = user_limits.get(user_id, 0) + 1
+        return output[0] if output else None
     except Exception as e:
-        await message.reply_text(f"❌ Failed to generate image. Error: {e}")
-    finally:
-        os.remove(file_path)
+        print("Error:", e)
+        return None
+
+
+@app.on_message(filters.command("vip"))
+async def vip_info(client, message: Message):
+    await message.reply(
+        "💎 VIP Access costs ₹99. UPI QR below. After payment, forward receipt to @" + OWNER_USERNAME,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Pay Now", url="upi://pay?pa=yourupi@upi&pn=CartoonBot&am=99")]
+        ])
+    )
+    log_action(message.from_user.id, "Requested VIP info")
+
+
+@app.on_message(filters.command("log"))
+async def show_logs(client, message: Message):
+    if message.from_user.username != OWNER_USERNAME:
+        return await message.reply("Access Denied ❌")
+
+    with open(LOG_FILE, "rb") as f:
+        await message.reply_document(f)
+
 
 app.run()
